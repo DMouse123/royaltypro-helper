@@ -153,8 +153,75 @@ struct ProcessResponse {
 
 // ── HTTP handlers ─────────────────────────────────────────────────────
 
+// v0.0.6: clean up orphan dylib files from previous helper sessions.
+// Pre-v0.0.5 helpers (and any helper that crashed mid-init) left
+// rp-engine-<pid>-<ts>.dylib files in $TMPDIR. v0.0.5 unlinks each dylib
+// it loads, but inherits files from older helper PIDs. On startup we scan
+// the temp dir, identify rp-engine-*.dylib files, skip our own PID's, and
+// delete the rest. Defensive — anyone upgrading from v0.0.3/v0.0.4 gets a
+// clean slate. Failure (permission, race) is logged but non-fatal —
+// helper continues to boot.
+fn cleanup_orphan_dylibs() {
+    let temp_dir = std::env::temp_dir();
+    let own_pid = std::process::id();
+    let own_pid_marker = format!("rp-engine-{}-", own_pid);
+    let entries = match std::fs::read_dir(&temp_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "[helper] v0.0.6 SEC: orphan cleanup skipped — can't read {}: {}",
+                temp_dir.display(), e
+            );
+            return;
+        }
+    };
+    let mut deleted = 0usize;
+    let mut skipped_own = 0usize;
+    let mut errors = 0usize;
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if !name.starts_with("rp-engine-") || !name.ends_with(".dylib") {
+            continue;
+        }
+        if name.starts_with(&own_pid_marker) {
+            skipped_own += 1;
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(_) => {
+                println!("[helper] v0.0.6 SEC: orphan unlinked — {}", path.display());
+                deleted += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[helper] v0.0.6 SEC: failed to unlink orphan {} — {}",
+                    path.display(), e
+                );
+                errors += 1;
+            }
+        }
+    }
+    if deleted > 0 || skipped_own > 0 || errors > 0 {
+        println!(
+            "[helper] v0.0.6 SEC: orphan cleanup done · deleted={} skipped_own={} errors={}",
+            deleted, skipped_own, errors
+        );
+    } else {
+        println!("[helper] v0.0.6 SEC: orphan cleanup done · no rp-engine-*.dylib found");
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // v0.0.6: clean up any leftover dylib files from previous helper sessions
+    // BEFORE we start serving requests. Runs once per helper boot. ~Instant on
+    // a clean tmp dir, ~ms even with dozens of orphans.
+    cleanup_orphan_dylibs();
+
     let state = AppState::default();
 
     // v0.0.4: lock CORS to known production + dev origins ONLY.
