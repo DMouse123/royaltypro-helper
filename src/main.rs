@@ -278,6 +278,26 @@ async fn init_engine(body: Bytes) -> Result<Json<InitResponse>, (StatusCode, Str
         }
     };
 
+    // v0.0.5: SECURITY — unlink temp dylib immediately after dlopen succeeds.
+    // On macOS/Linux dlopen mmaps the file; the kernel keeps the mapping alive
+    // even after the directory entry is removed, so the engine continues to run
+    // in memory. Effect: the dylib file vanishes from disk seconds after import,
+    // so a local attacker (with shell access on the user's account) can't cp the
+    // engine bytes off /var/folders/.../T/rp-engine-*.dylib while the helper is
+    // active. Before v0.0.5 the file stayed on disk for the whole helper
+    // lifetime (could be days/weeks for users who never kill the daemon).
+    // Pure security hardening — does NOT affect engine functionality.
+    match std::fs::remove_file(&path) {
+        Ok(_) => println!(
+            "[helper] v0.0.5 SEC: temp dylib unlinked from disk after dlopen · path was {}",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "[helper] v0.0.5 SEC: WARN failed to unlink temp dylib at {} — engine still works but bytes remain on disk: {}",
+            path.display(), e
+        ),
+    }
+
     // Resolve all symbols
     let alloc: Symbol<FnRpAlloc> = match unsafe { lib.get(b"rp_alloc\0") } {
         Ok(s) => s,
