@@ -35,7 +35,8 @@ use std::ffi::{c_char, CStr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use axum::http::HeaderValue;
 
 const PORT: u16 = 17891;
 
@@ -58,6 +59,7 @@ type FnRpProcess = unsafe extern "C" fn(
     name_len: usize,
 ) -> RpResult;
 type FnRpRun = unsafe extern "C" fn(request_ptr: *const u8, request_len: usize) -> RpResult;
+type FnRpProgress = unsafe extern "C" fn() -> u64;
 
 // Sendable wrappers — we hold the function pointers across threads.
 // Safety: the dylib stays loaded for the helper's lifetime, the
@@ -71,6 +73,7 @@ struct EngineApi {
     last_error: FnRpLastError,
     process: FnRpProcess,
     run: FnRpRun,
+    progress: Option<FnRpProgress>,
     version: String,
     loaded_at_ms: u128,
     dylib_path: String,
@@ -104,6 +107,17 @@ struct JobStatus {
     /// "json" (helper path, no envelope) or "bundle" (.RoyaltyProData).
     format: Option<String>,
     error: Option<String>,
+    // Live progress (populated by /status handler each time it's hit, via
+    // rp_progress() FFI on the loaded engine). Skipped from serialization
+    // if None so older clients ignoring these fields stay compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_name: Option<String>,
 }
 
 // ── Responses ─────────────────────────────────────────────────────────
@@ -143,10 +157,24 @@ struct ProcessResponse {
 async fn main() {
     let state = AppState::default();
 
+    // v0.0.4: lock CORS to known production + dev origins ONLY.
+    // Was: .allow_origin(Any) — accepted requests from ANY origin, including
+    // malicious tabs the user happens to have open. With the helper exposing
+    // /process (arbitrary file read) and /init (dylib upload + dlopen),
+    // wildcard CORS = drive-by file exfiltration + RCE from any web page.
+    // The browser sets the Origin header and JS can't spoof it, so a strict
+    // allowlist + browser CORS enforcement closes the entire web-borne attack
+    // surface. Non-browser callers (curl, native attackers) bypass CORS but
+    // already need filesystem access to do harm; web-borne is the real threat.
+    let allowed_origins: Vec<HeaderValue> = vec![
+        "https://member.royaltypro.app".parse().unwrap(),
+        "http://localhost:5173".parse().unwrap(),  // dev vite
+        "http://localhost:2222".parse().unwrap(),  // dev node server
+    ];
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_origin(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -199,13 +227,26 @@ async fn init_engine(body: Bytes) -> Result<Json<InitResponse>, (StatusCode, Str
         ));
     }
 
-    // Hash for identity / debugging
+    // True SHA-256 of the dylib bytes — must match what the member portal
+    // returns in the X-Engine-SHA256 header so the web app can detect when
+    // its in-RAM engine is out of sync with the server's current dylib.
+    // Helper v0.0.2 and earlier used a non-cryptographic DefaultHasher
+    // here and labelled it sha256_hex — never matched real SHA-256, which
+    // broke auto-sync.
     let sha256_hex = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&body);
+        let digest = hasher.finalize();
+        let mut s = String::with_capacity(64);
+        for b in digest { use std::fmt::Write as _; let _ = write!(&mut s, "{:02x}", b); }
+        s
+    };
+    // Old DefaultHasher path kept here as dead code reference for future
+    // git-blame digs. Remove after v0.0.3 is widely deployed.
+    let _ = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        // Fast fingerprint — for cryptographic hash we'd use sha2 but we
-        // don't want sha2 in the helper itself (keep deps thin); the
-        // dylib has it baked in already.
         let mut h = DefaultHasher::new();
         body.as_ref().hash(&mut h);
         format!("{:016x}", h.finish())
@@ -262,6 +303,11 @@ async fn init_engine(body: Bytes) -> Result<Json<InitResponse>, (StatusCode, Str
         Ok(s) => s,
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("rp_run: {}", e))),
     };
+    // rp_progress is optional — older dylib versions don't ship it. If
+    // resolving fails we just don't expose progress to the web app; the
+    // import still works, just without per-file feedback.
+    let progress_sym: Option<Symbol<FnRpProgress>> = unsafe { lib.get(b"rp_progress\0").ok() };
+    let progress: Option<FnRpProgress> = progress_sym.as_deref().copied();
 
     let version_str = unsafe {
         let p = version_fn();
@@ -276,6 +322,7 @@ async fn init_engine(body: Bytes) -> Result<Json<InitResponse>, (StatusCode, Str
         last_error: *last_error,
         process: *process,
         run: *run,
+        progress,
         version: version_str.clone(),
         loaded_at_ms: chrono_ish_now_millis(),
         dylib_path: path.to_string_lossy().into_owned(),
@@ -322,6 +369,7 @@ async fn start_process(
             password: None,
             format: None,
             error: Some("engine not loaded — POST /init first".to_string()),
+            stage: None, current_index: None, total: None, current_name: None,
         };
         state.jobs.lock().unwrap().insert(job_id.clone(), s);
         return (
@@ -344,6 +392,7 @@ async fn start_process(
         password: None,
         format: None,
         error: None,
+        stage: None, current_index: None, total: None, current_name: None,
     };
     state.jobs.lock().unwrap().insert(job_id.clone(), initial);
 
@@ -433,17 +482,56 @@ async fn get_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<JobStatus>, StatusCode> {
-    let map = state.jobs.lock().unwrap();
-    match map.get(&id) {
-        Some(status) => {
-            let mut s = status.clone();
-            if s.state == "running" {
-                s.elapsed_ms = chrono_ish_now_millis() - s.started_ms;
-            }
-            Ok(Json(s))
+    // Snapshot the job + the live engine progress under separate locks so
+    // we don't hold the jobs lock across the engine FFI call.
+    let mut s = {
+        let map = state.jobs.lock().unwrap();
+        match map.get(&id) {
+            Some(status) => status.clone(),
+            None => return Err(StatusCode::NOT_FOUND),
         }
-        None => Err(StatusCode::NOT_FOUND),
+    };
+    if s.state == "running" {
+        s.elapsed_ms = chrono_ish_now_millis() - s.started_ms;
+        // Pull live progress from the engine's atomic counter. Decode the
+        // packed u64 set by set_progress() in native_tool:
+        //   bits 0..32  = current_index (0-based)
+        //   bits 32..40 = stage  (1=parsing, 2=summary_scan, 3=bundling, 4=done)
+        //   bits 40..64 = total  (file count for this run)
+        let progress_fn = engine_slot()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|api| api.progress);
+        if let Some(progress_fn) = progress_fn {
+            let packed = unsafe { progress_fn() };
+            let current = (packed & 0xFFFFFFFF) as u32;
+            let stage_code = ((packed >> 32) & 0xFF) as u32;
+            let total = ((packed >> 40) & 0xFFFFFF) as u32;
+            let stage_name = match stage_code {
+                1 => Some("parsing".to_string()),
+                2 => Some("summary_scan".to_string()),
+                3 => Some("bundling".to_string()),
+                4 => Some("done".to_string()),
+                _ => None,
+            };
+            if stage_code != 0 {
+                s.stage = stage_name;
+                s.current_index = Some(current);
+                s.total = Some(if total > 0 { total } else { s.paths.len() as u32 });
+                // Resolve current file name from paths array. During the
+                // parsing stage `current` is the file index; during summary
+                // scan it's the chunk index which usually matches file count.
+                if (current as usize) < s.paths.len() {
+                    s.current_name = std::path::PathBuf::from(&s.paths[current as usize])
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_string());
+                }
+            }
+        }
     }
+    Ok(Json(s))
 }
 
 fn run_engine_process(
